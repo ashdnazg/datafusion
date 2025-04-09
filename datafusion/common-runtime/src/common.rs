@@ -15,18 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::future::Future;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
-use crate::JoinSet;
-use tokio::task::JoinError;
+use tokio::task::{JoinError, JoinHandle};
 
 /// Helper that  provides a simple API to spawn a single task and join it.
 /// Provides guarantees of aborting on `Drop` to keep it cancel-safe.
+/// Note that if the task was spawned with `spawn_blocking`, it will only be
+/// aborted if it hasn't started yet.
 ///
-/// Technically, it's just a wrapper of `JoinSet` (with size=1).
+/// Technically, it's just a wrapper of a `JoinHandle` overriding drop.
 #[derive(Debug)]
 pub struct SpawnedTask<R> {
-    inner: JoinSet<R>,
+    inner: JoinHandle<R>,
 }
 
 impl<R: 'static> SpawnedTask<R> {
@@ -36,8 +41,8 @@ impl<R: 'static> SpawnedTask<R> {
         T: Send + 'static,
         R: Send,
     {
-        let mut inner = JoinSet::new();
-        inner.spawn(task);
+        #[allow(clippy::disallowed_methods)]
+        let inner = tokio::task::spawn(task);
         Self { inner }
     }
 
@@ -47,22 +52,20 @@ impl<R: 'static> SpawnedTask<R> {
         T: Send + 'static,
         R: Send,
     {
-        let mut inner = JoinSet::new();
-        inner.spawn_blocking(task);
+        #[allow(clippy::disallowed_methods)]
+        let inner = tokio::task::spawn_blocking(task);
         Self { inner }
     }
 
     /// Joins the task, returning the result of join (`Result<R, JoinError>`).
-    pub async fn join(mut self) -> Result<R, JoinError> {
-        self.inner
-            .join_next()
-            .await
-            .expect("`SpawnedTask` instance always contains exactly 1 task")
+    /// Same as awaiting the spawned task, but left for backwards compatibility.
+    pub async fn join(self) -> Result<R, JoinError> {
+        self.await
     }
 
     /// Joins the task and unwinds the panic if it happens.
     pub async fn join_unwind(self) -> Result<R, JoinError> {
-        self.join().await.map_err(|e| {
+        self.await.map_err(|e| {
             // `JoinError` can be caused either by panic or cancellation. We have to handle panics:
             if e.is_panic() {
                 std::panic::resume_unwind(e.into_panic());
@@ -74,6 +77,20 @@ impl<R: 'static> SpawnedTask<R> {
                 e
             }
         })
+    }
+}
+
+impl<R> Future for SpawnedTask<R> {
+    type Output = Result<R, JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.inner).poll(cx)
+    }
+}
+
+impl<R> Drop for SpawnedTask<R> {
+    fn drop(&mut self) {
+        self.inner.abort();
     }
 }
 
