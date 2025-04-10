@@ -23,8 +23,10 @@ pub(crate) mod spill_manager;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow::array::ArrayData;
 use arrow::datatypes::{Schema, SchemaRef};
@@ -35,18 +37,22 @@ use datafusion_common::{exec_datafusion_err, DataFusionError, HashSet, Result};
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::RecordBatchStream;
+use futures::future::Fuse;
 use futures::{FutureExt as _, Stream};
+use tokio::sync::mpsc;
 
 /// Stream that reads spill files from disk where each batch is read in a spawned blocking task
 /// It will read one batch at a time and will not do any buffering, to buffer data use [`crate::common::spawn_buffered`]
 struct SpillReaderStream {
     schema: SchemaRef,
+    buffer_capacity: usize,
     state: SpillReaderStreamState,
 }
 
 /// When we poll for the next batch, we will get back both the batch and the reader,
 /// so we can call `next` again.
-type NextRecordBatchResult = Result<(StreamReader<BufReader<File>>, Option<RecordBatch>)>;
+type TaskResult =
+    Result<Option<(StreamReader<BufReader<File>>, mpsc::Sender<RecordBatch>)>>;
 
 enum SpillReaderStreamState {
     /// Initial state: the stream was not initialized yet
@@ -54,27 +60,73 @@ enum SpillReaderStreamState {
     Uninitialized(RefCountedTempFile),
 
     /// A read is in progress in a spawned blocking task for which we hold the handle.
-    ReadInProgress(SpawnedTask<NextRecordBatchResult>),
-
-    /// A read has finished and we wait for being polled again in order to start reading the next batch.
-    Waiting(StreamReader<BufReader<File>>),
+    ReadInProgress {
+        task: Fuse<SpawnedTask<TaskResult>>,
+        receiver: mpsc::Receiver<RecordBatch>,
+    },
 
     /// The stream has finished, successfully or not.
     Done,
 }
 
 impl SpillReaderStream {
-    fn new(schema: SchemaRef, spill_file: RefCountedTempFile) -> Self {
+    fn new(
+        schema: SchemaRef,
+        buffer_capacity: usize,
+        spill_file: RefCountedTempFile,
+    ) -> Self {
         Self {
             schema,
+            buffer_capacity,
             state: SpillReaderStreamState::Uninitialized(spill_file),
+        }
+    }
+
+    fn read_and_send(
+        mut reader: StreamReader<BufReader<File>>,
+        sender: mpsc::Sender<RecordBatch>,
+    ) -> TaskResult {
+        while let Ok(permit) = sender.try_reserve() {
+            let Some(next_batch) = reader.next().transpose()? else {
+                // Stream is done
+                return Ok(None);
+            };
+            permit.send(next_batch);
+        }
+
+        Ok(Some((reader, sender)))
+    }
+
+    fn poll_task(
+        task: &mut Fuse<SpawnedTask<TaskResult>>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<()>> {
+        loop {
+            let task_result = futures::ready!(task.poll_unpin(cx))
+                .unwrap_or_else(|err| Err(DataFusionError::External(Box::new(err))));
+
+            match task_result {
+                Ok(Some((reader, sender))) => {
+                    // The file isn't finished yet, so we spawn another task.
+                    *task = SpawnedTask::spawn_blocking(|| {
+                        Self::read_and_send(reader, sender)
+                    }).fuse();
+
+                    // We continue the loop and poll again, since we need to register the new task's waker.
+                }
+                Ok(None) => {
+                    // We finished reading the file.
+                    break Poll::Ready(Ok(()));
+                }
+                Err(error) => break Poll::Ready(Err(error)),
+            }
         }
     }
 
     fn poll_next_inner(
         &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<RecordBatch>>> {
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<RecordBatch>>> {
         match &mut self.state {
             SpillReaderStreamState::Uninitialized(_) => {
                 // Temporarily replace with `Done` to be able to pass the file to the task.
@@ -84,77 +136,56 @@ impl SpillReaderStream {
                     unreachable!()
                 };
 
+                let (sender, receiver) = mpsc::channel(self.buffer_capacity);
+
                 let task = SpawnedTask::spawn_blocking(move || {
                     let file = BufReader::new(File::open(spill_file.path())?);
                     // SAFETY: DataFusion's spill writer strictly follows Arrow IPC specifications
                     // with validated schemas and buffers. Skip redundant validation during read
                     // to speedup read operation. This is safe for DataFusion as input guaranteed to be correct when written.
-                    let mut reader = unsafe {
+                    let reader = unsafe {
                         StreamReader::try_new(file, None)?.with_skip_validation(true)
                     };
 
-                    let next_batch = reader.next().transpose()?;
+                    Self::read_and_send(reader, sender)
+                }).fuse();
 
-                    Ok((reader, next_batch))
-                });
+                self.state = SpillReaderStreamState::ReadInProgress {
+                    task,
+                    receiver,
+                };
 
-                self.state = SpillReaderStreamState::ReadInProgress(task);
-
-                // Poll again immediately so the inner task is polled and the waker is
+                // Poll again immediately so the receiver and the task are polled and the waker is
                 // registered.
                 self.poll_next_inner(cx)
             }
 
-            SpillReaderStreamState::ReadInProgress(task) => {
-                let result = futures::ready!(task.poll_unpin(cx))
-                    .unwrap_or_else(|err| Err(DataFusionError::External(Box::new(err))));
-
-                match result {
-                    Ok((reader, batch)) => {
-                        match batch {
-                            Some(batch) => {
-                                self.state = SpillReaderStreamState::Waiting(reader);
-
-                                std::task::Poll::Ready(Some(Ok(batch)))
-                            }
-                            None => {
-                                // Stream is done
-                                self.state = SpillReaderStreamState::Done;
-
-                                std::task::Poll::Ready(None)
-                            }
-                        }
-                    }
-                    Err(err) => {
+            SpillReaderStreamState::ReadInProgress {
+                task,
+                receiver,
+            } => {
+                let receiver_poll_result = receiver.poll_recv(cx);
+                let task_poll_result = Self::poll_task(task, cx);
+                match (receiver_poll_result, task_poll_result) {
+                    (_, Poll::Ready(Err(error))) => {
                         self.state = SpillReaderStreamState::Done;
 
-                        std::task::Poll::Ready(Some(Err(err)))
+                        Poll::Ready(Some(Err(error)))
                     }
+                    (Poll::Ready(Some(record_batch)), _) => {
+                        Poll::Ready(Some(Ok(record_batch)))
+                    }
+                    (Poll::Ready(None), _) => {
+                        // Sender was dropped, so we know we finished reading the file.
+                        self.state = SpillReaderStreamState::Done;
+
+                        Poll::Ready(None)
+                    }
+                    (Poll::Pending, _) => Poll::Pending,
                 }
             }
 
-            SpillReaderStreamState::Waiting(_) => {
-                // Temporarily replace with `Done` to be able to pass the file to the task.
-                let SpillReaderStreamState::Waiting(mut reader) =
-                    std::mem::replace(&mut self.state, SpillReaderStreamState::Done)
-                else {
-                    unreachable!()
-                };
-
-                let task = SpawnedTask::spawn_blocking(move || {
-                    let next_batch = reader.next().transpose()?;
-
-                    Ok((reader, next_batch))
-                });
-
-                self.state = SpillReaderStreamState::ReadInProgress(task);
-
-                // Poll again immediately so the inner task is polled and the waker is
-                // registered.
-                self.poll_next_inner(cx)
-            }
-
-            SpillReaderStreamState::Done => std::task::Poll::Ready(None),
+            SpillReaderStreamState::Done => Poll::Ready(None),
         }
     }
 }
@@ -162,10 +193,7 @@ impl SpillReaderStream {
 impl Stream for SpillReaderStream {
     type Item = Result<RecordBatch>;
 
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.get_mut().poll_next_inner(cx)
     }
 }

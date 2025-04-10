@@ -27,7 +27,7 @@ use datafusion_common::Result;
 use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::SendableRecordBatchStream;
 
-use crate::{common::spawn_buffered, metrics::SpillMetrics};
+use crate::metrics::SpillMetrics;
 
 use super::{in_progress_spill_file::InProgressSpillFile, SpillReaderStream};
 
@@ -127,9 +127,10 @@ impl SpillManager {
     ) -> Result<SendableRecordBatchStream> {
         let stream = Box::pin(SpillReaderStream::new(
             Arc::clone(&self.schema),
+            self.batch_read_buffer_capacity,
             spill_file_path,
         ));
 
-        Ok(spawn_buffered(stream, self.batch_read_buffer_capacity))
+        Ok(stream)
     }
 }
