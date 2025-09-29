@@ -542,7 +542,15 @@ impl GroupedHashAggregateStream {
             .with_can_spill(true)
             .register(context.memory_pool());
         let group_ordering = GroupOrdering::try_new(&agg.input_order_mode)?;
-        let group_values = new_group_values(group_schema, &group_ordering)?;
+        let group_values = new_group_values(
+            group_schema,
+            &group_ordering,
+            context
+                .session_config()
+                .options()
+                .execution
+                .enable_multi_group_by,
+        )?;
         timer.done();
 
         let exec_state = ExecutionState::ReadingInput;

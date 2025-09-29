@@ -119,7 +119,7 @@ pub trait GroupValues: Send {
 ///   - If group by single column, and type of this column has
 ///     the specific [`GroupValues`] implementation, such implementation
 ///     will be chosen.
-///   
+///
 ///   - If group by multiple columns, and all column types have the specific
 ///     `GroupColumn` implementations, `GroupValuesColumn` will be chosen.
 ///
@@ -132,6 +132,7 @@ pub trait GroupValues: Send {
 pub fn new_group_values(
     schema: SchemaRef,
     group_ordering: &GroupOrdering,
+    enable_multi_group_by: bool,
 ) -> Result<Box<dyn GroupValues>> {
     if schema.fields.len() == 1 {
         let d = schema.fields[0].data_type();
@@ -195,7 +196,7 @@ pub fn new_group_values(
         }
     }
 
-    if multi_group_by::supported_schema(schema.as_ref()) {
+    if enable_multi_group_by && multi_group_by::supported_schema(schema.as_ref()) {
         if matches!(group_ordering, GroupOrdering::None) {
             Ok(Box::new(GroupValuesColumn::<false>::try_new(schema)?))
         } else {

@@ -501,6 +501,10 @@ config_namespace! {
         /// written, it may be necessary to increase this size to avoid errors from
         /// the remote end point.
         pub objectstore_writer_buffer_size: usize, default = 10 * 1024 * 1024
+
+        /// Should Datafusion use the multi-group-by columns implementation instead of
+        /// the row converter.
+        pub enable_multi_group_by: bool, default = true
     }
 }
 
